@@ -39,23 +39,33 @@ def get_price_yfinance(symbol):
     return None
 
 def get_price_nse(symbol):
-    """Fallback: fetch from NSE India directly"""
+    """Fetch live price from NSE India using a proper browser-like session.
+    NSE blocks requests without valid cookies, so we first visit the homepage
+    to get session cookies, then hit the quote API with those cookies."""
     try:
-        import urllib.request
+        import requests
+        session = requests.Session()
         headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-            "Referer": "https://www.nseindia.com"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
         }
+        # Step 1: visit homepage to establish session cookies
+        session.get("https://www.nseindia.com", headers=headers, timeout=8)
+        # Step 2: hit the quote API using the same session (now has cookies)
+        api_headers = dict(headers)
+        api_headers["Accept"] = "application/json"
+        api_headers["Referer"] = f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
         url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
+        resp = session.get(url, headers=api_headers, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
             price = data.get("priceInfo", {}).get("lastPrice")
             if price:
                 return round(float(price), 2)
     except Exception as e:
-        print(f"NSE error for {symbol}: {e}")
+        print(f"NSE session error for {symbol}: {e}")
     return None
 
 def get_price(symbol):
@@ -63,9 +73,9 @@ def get_price(symbol):
     if symbol in price_cache and now - price_cache[symbol]["ts"] < CACHE_TTL:
         return price_cache[symbol]["price"]
 
-    price = get_price_yfinance(symbol)
+    price = get_price_nse(symbol)
     if not price:
-        price = get_price_nse(symbol)
+        price = get_price_yfinance(symbol)
 
     if price:
         price_cache[symbol] = {"price": price, "ts": now}
@@ -303,56 +313,28 @@ async function saveToServer(){
   catch(e){showToast('Save failed','error');}
 }
 
-// ── CLIENT-SIDE PRICE FETCH ──
-// Render's server IP gets blocked by Yahoo/NSE (datacenter IP blocking).
-// So we fetch directly from the user's browser instead, via a free CORS proxy.
-// Try multiple proxies in sequence for resilience.
-const CORS_PROXIES = [
-  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-  url => `https://thingproxy.freeboard.io/fetch/${url}`
-];
-
-async function fetchYahooPrice(symbol){
-  for(const suffix of ['.NS','.BO']){
-    const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}${suffix}?interval=1d&range=5d`;
-    for(const proxyFn of CORS_PROXIES){
-      try{
-        const proxied = proxyFn(yahooUrl);
-        const res = await fetch(proxied, { signal: AbortSignal.timeout(8000) });
-        if(!res.ok) continue;
-        const data = await res.json();
-        const result = data?.chart?.result?.[0];
-        const price = result?.meta?.regularMarketPrice;
-        if(price && price > 0){
-          return Math.round(price * 100) / 100;
-        }
-      }catch(e){ continue; }
-    }
-  }
-  return null;
-}
-
 async function refreshPrices(){
   const syms=Object.keys(holdings);
   if(!syms.length){showToast('No holdings to refresh','error');return;}
   const icon=document.getElementById('refresh-icon'),btn=document.getElementById('refresh-btn');
   icon.classList.add('spinning');btn.disabled=true;
   showToast(`Fetching prices for ${syms.join(', ')}…`,'success');
-  let updated=0,failed=[];
-  for(const s of syms){
-    const price = await fetchYahooPrice(s);
-    if(price){ holdings[s].cmp = price; updated++; }
-    else failed.push(s);
-  }
-  await saveToServer();render();
-  const infoEl=document.getElementById('price-refresh-info');
-  const now=new Date().toLocaleTimeString('en-IN');
-  let msg=`✓ Prices refreshed at ${now} — ${updated}/${syms.length} updated`;
-  if(failed.length) msg+=` | Not found: ${failed.join(', ')} (check symbol spelling)`;
-  if(infoEl){ infoEl.innerHTML=msg; infoEl.style.display='block'; }
-  showToast(updated>0?`✓ ${updated}/${syms.length} prices updated`:'Could not fetch any prices — try again','success');
-  icon.classList.remove('spinning');btn.disabled=false;
+  try{
+    const prices=await api('/api/prices',{method:'POST',body:JSON.stringify({symbols:syms})});
+    let updated=0,failed=[];
+    syms.forEach(s=>{
+      if(prices[s]){holdings[s].cmp=prices[s];updated++;}
+      else failed.push(s);
+    });
+    await saveToServer();render();
+    const infoEl=document.getElementById('price-refresh-info');
+    const now=new Date().toLocaleTimeString('en-IN');
+    let msg=`✓ Prices refreshed at ${now} — ${updated}/${syms.length} updated`;
+    if(failed.length) msg+=` | Not found: ${failed.join(', ')} (check symbol spelling)`;
+    if(infoEl){infoEl.innerHTML=msg;infoEl.style.display='block';}
+    showToast(updated>0?`✓ ${updated}/${syms.length} prices updated`:'Could not fetch prices — try again','success');
+  }catch(e){showToast('Price fetch failed — try again','error');}
+  finally{icon.classList.remove('spinning');btn.disabled=false;}
 }
 
 let symTimer=null;
@@ -362,11 +344,13 @@ function onSymInput(){
   const cmpEl=document.getElementById('a-cmp');
   cmpEl.value='';cmpEl.style.borderColor='';
   if(sym.length<2){cmpEl.placeholder='Type symbol above to fetch…';return;}
-  cmpEl.placeholder='Fetching…';
+  cmpEl.placeholder='Fetching from NSE…';
   symTimer=setTimeout(async()=>{
-    const price = await fetchYahooPrice(sym);
-    if(price){cmpEl.value=price;cmpEl.style.borderColor='#1D9E75';cmpEl.placeholder='';}
-    else{cmpEl.placeholder='Not found — enter manually';cmpEl.style.borderColor='#D85A30';}
+    try{
+      const d=await api(`/api/price/${sym}`);
+      if(d.price){cmpEl.value=d.price;cmpEl.style.borderColor='#1D9E75';cmpEl.placeholder='';}
+      else{cmpEl.placeholder='Not found — enter manually';cmpEl.style.borderColor='#D85A30';}
+    }catch(e){cmpEl.placeholder='Could not fetch — enter manually';}
   },800);
 }
 
@@ -592,23 +576,51 @@ def get_single_price(symbol):
 
 @app.route("/api/debug/<symbol>")
 def debug_price(symbol):
-    """Debug endpoint to see what's happening with price fetch"""
-    import traceback
+    """Debug endpoint to see exactly what's happening with each price source"""
     results = {}
+    sym = symbol.upper()
+
+    # Test NSE session approach
+    try:
+        import requests
+        session = requests.Session()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        home_resp = session.get("https://www.nseindia.com", headers=headers, timeout=8)
+        api_headers = dict(headers)
+        api_headers["Accept"] = "application/json"
+        api_headers["Referer"] = f"https://www.nseindia.com/get-quotes/equity?symbol={sym}"
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={sym}"
+        resp = session.get(url, headers=api_headers, timeout=8)
+        results["nse"] = {
+            "homepage_status": home_resp.status_code,
+            "quote_status": resp.status_code,
+            "body_preview": resp.text[:300]
+        }
+        if resp.status_code == 200:
+            data = resp.json()
+            results["nse"]["price"] = data.get("priceInfo", {}).get("lastPrice")
+    except Exception as e:
+        results["nse"] = {"error": str(e)}
+
+    # Test yfinance approach
     try:
         import yfinance as yf
         for suffix in [".NS", ".BO"]:
             try:
-                t = yf.Ticker(symbol.upper() + suffix)
+                t = yf.Ticker(sym + suffix)
                 hist = t.history(period="2d", interval="1d")
-                results[suffix] = {
+                results[f"yfinance{suffix}"] = {
                     "empty": hist.empty,
                     "price": round(float(hist["Close"].iloc[-1]), 2) if not hist.empty else None
                 }
             except Exception as e:
-                results[suffix] = {"error": str(e)}
+                results[f"yfinance{suffix}"] = {"error": str(e)}
     except Exception as e:
         results["yfinance_import"] = {"error": str(e)}
+
     return jsonify(results)
 
 if __name__ == "__main__":
